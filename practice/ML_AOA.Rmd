@@ -1,0 +1,160 @@
+---
+title: "UAV images, satellite data and machine learning for land cover mapping"
+subtitle: "Material for the course on machine learning taught at the UAV School in Göttingen (26.-30.10.2020)"
+author: "Hanna Meyer"
+date: "7/28/2020"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+This tutorial aims to show the general workflow of how land cover classifications (or similar tasks) based on satellite data can be performed in R using machine learning algorithms.
+
+
+### Prediction task
+The example prediction task is to perfom a supervised land cover classification for Münster in Germany.
+The dataset to do this includes selected spectral channels of a Sentinel-2 scene as well as derived artificial channels (NDVI as well as the standard deviation of the NDVI in a 5x5 pixel environment). As resposne (reference/ground truth) we use digitized polygons that were created on the basis of expert knowledge with support of high resolution data (aerial images).
+
+### How to start
+
+For this tutorial we need the raster package for processing of the satellite data as well as the caret package as a wrapper for machine learning (here: randomForest) algorithms. Sf is used for handling of the training data available as vector data (polygons). Mapview is used for spatial visualization of the data. CAST will be used to account for spatial dependencies during model validation.
+
+```{r start, message=FALSE, warning=FALSE}
+rm(list=ls())
+#major required packages:
+library(raster)
+library(caret)
+library(mapview)
+library(sf)
+library(CAST)
+library(tmap)
+```
+
+## Data preparation
+
+### Load and explore the data
+To start with, let's load and explore the remote sensing raster data as well as the vector data that include the training sites.
+
+#### Raster data (predictor variables)
+
+```{r load, message=FALSE,warning=FALSE}
+sen_ms <- stack("data/Sen_Muenster.grd")
+print(sen_ms)
+
+```
+
+
+The RasterStack contains a subset of the optical data from Sentinel-2 (see band information here: https://en.wikipedia.org/wiki/Sentinel-2) given in scaled reflectances (B02-B11). In addition,the NDVI was calculated and spatial context is included as the standard deviation of the NDVI in a 5x5 pixel environment (NDVI_sd_5). 
+Let's plot the rasterStack to get an idea how the variables look like. 
+ 
+```{r visPredictors}
+plot(sen_ms)
+```
+
+#### Vector data (Response variable)
+The vector file is read as sf object. It contains the training sites of 7 Land cover classes. These are polygons (33 in total) that were digitized in QGIS on the basis of the Sentinel data and with support of an aerial image and using expert knowledge. They can be regarded here as a ground truth for the land cover classification.
+
+```{r loadPoly}
+trainSites <- read_sf("data/trainingsites_muenster.gpkg")
+print(trainSites)
+```
+
+
+Using mapview's viewRGB function we can visualize the aerial image channels as true color composite in the geographical context and overlay it with the polygons. Click on the polygons to see which land cover class is assigned to a respective polygon.
+
+```{r visMV, warning=FALSE, message= FALSE}
+viewRGB(sen_ms, r = 3, g = 2, b = 1, map.types = "Esri.WorldImagery")+
+  mapview(trainSites)
+```
+
+#### Extract raster information
+
+In order to train a machine learning model between the spectral properties and the land cover class, we first need to create a data frame that contains the predictor variables at the location of the training sites as well as the corresponding class information. This data frame can be produced with the extract function. The resulting data frame contains the predictor variables for each pixel overlayed by the polygons. This data frame then still needs to be merged with the information on the land cover class from the sf object.
+
+```{r extract}
+extr <- extract(sen_ms, trainSites, df=TRUE)
+extr <- merge(extr, trainSites, by.x="ID", by.y="PolygonID")
+head(extr)
+```
+
+In order to speed things up, for this tutorial we will reduce the data. Therefore, from each training polygon only 5% of the pixels will be used for model training.
+Therefore, from each polygon 5% of the pixels are randomly drawn.
+
+```{r subset}
+set.seed(100)
+trainids <- createDataPartition(extr$ID,list=FALSE,p=0.05)
+trainDat <- extr[trainids,]
+```
+
+## Model training
+### Predictors and response
+
+For model training we need to define the predictor and response variables. As predictors we can use basically all information from the raster stack as we might assume they could all be meaningful for the differentiation between the land cover classes. As response variable we use the "Label" column of the data frame.
+
+```{r vars}
+predictors <- names(sen_ms)
+response <- "Label"
+```
+
+### Model training
+We then train a Random Forest model to lean how the classes can be distinguished based on the predictors (note: other algorithms would work as well. See https://topepo.github.io/caret/available-models.html for a list of algorithms available in caret). Caret's train function is doing this job. Before starting model trainign we can specify some control settings using trainControl. For hyperparameter tuning (mtry) as well as for error assessment we use a spatial 3-fold cross-validation. Therefore the training data are split into 3 folds but data from the same polygon are always grouped so that they never occur in both, training and testing. Also we make sure that each fold contains data from each land cover class. CAST's CreateSpacetimeFolds is doing this job when we specify the polygon ID and the class label.
+
+```{r trainctrl, warning=FALSE, message=FALSE}
+indices <- CreateSpacetimeFolds(trainDat,spacevar = "ID",k=3,class="Label")
+ctrl <- trainControl(method="cv", 
+                     index = indices$index,
+                     savePredictions = TRUE)
+```
+
+Model training is then performed using caret's train function. 
+We specify "rf" as method, indicating that a Random Forest is applied. For model training we reduce the number of trees (ntree) to 75 to speed things up. Note that usually a larger number (>250) is appropriate. We use the Kappa index for validation.
+
+```{r train, warning=FALSE, message=FALSE, results='hide'}
+# train the model
+set.seed(100)
+model <- train(trainDat[,predictors],
+               trainDat[,response],
+               method="rf",
+               trControl=ctrl,
+               importance=TRUE, 
+               ntree=75)
+```
+
+```{r trainresult}
+print(model)
+plot(varImp(model))
+```
+
+## Model validation
+When we print the model (see above) we get a summary of the prediction performance as the average Kappa and Accuracy of the three spatial folds. Looking at all cross-validated predictions together we can get the "global" model performance.
+
+```{r valid_defaultmodel}
+# get all cross-validated predictions:
+cvPredictions <- model$pred[model$pred$mtry==model$bestTune$mtry,]
+# calculate cross table:
+table(cvPredictions$pred,cvPredictions$obs)
+```
+
+We see that the performance is very high and that only minor false classifications occur.
+
+## Model prediction and visualization
+To perform the classification we can use the trained model and apply it to each pixel of the raster stack using the predict function. Then we can then create a map with meaningful colors of the predicted land cover using the tmap package.
+
+```{r predict, message=FALSE, warning=FALSE}
+prediction <- predict(sen_ms,model)
+cols <- c("sandybrown", "green", "darkred", "blue", "forestgreen", "lightgreen", "red")
+
+tm_shape(deratify(prediction)) +
+  tm_raster(palette = cols,title = "LUC")+
+  tm_scale_bar(bg.color="white",bg.alpha=0.75)+
+  tm_layout(legend.bg.color = "white",
+            legend.bg.alpha = 0.75)
+```
+
